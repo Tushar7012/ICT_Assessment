@@ -1,377 +1,468 @@
 import google.generativeai as genai
 import os
-from typing import Dict, Any, List
+from typing import Dict, List, Any, Optional
 from database.mongodb_client import get_sync_database
+
+# Try to import function calling (may not be available in all accounts)
+try:
+    from google.generativeai.types import FunctionDeclaration, Tool
+    HAS_FUNCTION_CALLING = True
+except ImportError:
+    HAS_FUNCTION_CALLING = False
+
+import json
 
 # Configure Gemini
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 class YouTubeADKAgent:
-    """
-    Production-grade AI Agent for YouTube Analytics
-    Features:
-    - Tool-based architecture
-    - Input validation
-    - Error handling
-    - Multi-tool orchestration
-    """
+    """Production-grade AI Agent using Google ADK with function calling"""
     
     def __init__(self):
-        """Initialize agent with database connection and AI model"""
+        self.db = get_sync_database()
+        
+        # Try to initialize with function calling, fallback to simple mode
         try:
-            self.db = get_sync_database()
-            # Use gemini-pro (most stable and widely available)
-            self.model = genai.GenerativeModel('gemini-pro')
-            self.initialized = True
+            if HAS_FUNCTION_CALLING:
+                # Define tools with proper schema (ADK requirement)
+                self.tools = self._define_tools()
+                
+                # Initialize model with function calling - USE GEMINI-PRO
+                self.model = genai.GenerativeModel(
+                    model_name='gemini-pro',  # CHANGED FROM gemini-1.5-flash
+                    tools=[self.tools]
+                )
+                
+                # Start chat session for multi-turn conversations
+                self.chat = self.model.start_chat()
+                self.use_function_calling = True
+            else:
+                raise Exception("Function calling not available")
         except Exception as e:
-            print(f"Agent initialization error: {e}")
-            self.initialized = False
+            # Fallback to simple mode
+            print(f"Function calling not available, using fallback mode: {e}")
+            self.model = genai.GenerativeModel('gemini-pro')
+            self.use_function_calling = False
+    
+    def _define_tools(self) -> Tool:
+        """
+        Define tools with proper schema definition (ADK standard)
+        This enables automatic tool orchestration
+        """
+        if not HAS_FUNCTION_CALLING:
+            return None
+        
+        get_video_stats_func = FunctionDeclaration(
+            name="get_video_stats",
+            description="Get total count of videos in the database. Use this when user asks about total videos, how many videos, or database size.",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        )
+        
+        get_recent_videos_func = FunctionDeclaration(
+            name="get_recent_videos",
+            description="Retrieve the most recent videos from database. Use when user asks for recent, latest, or new videos.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of videos to retrieve (default: 5, max: 20)"
+                    }
+                },
+                "required": []
+            }
+        )
+        
+        search_videos_func = FunctionDeclaration(
+            name="search_videos",
+            description="Search for videos by keyword in title or description. Use when user wants to find specific content.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "Search keyword or phrase"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default: 10)"
+                    }
+                },
+                "required": ["keyword"]
+            }
+        )
+        
+        get_channel_stats_func = FunctionDeclaration(
+            name="get_channel_stats",
+            description="Get detailed statistics for a specific YouTube channel including video count, total views, and engagement metrics.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "channel_name": {
+                        "type": "string",
+                        "description": "Name of the channel (e.g., 'REPORTER', 'ANI News')"
+                    }
+                },
+                "required": ["channel_name"]
+            }
+        )
+        
+        get_trending_videos_func = FunctionDeclaration(
+            name="get_trending_videos",
+            description="Get trending videos sorted by view count. Use when user asks about popular, trending, or most viewed videos.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of trending videos to retrieve (default: 5)"
+                    }
+                },
+                "required": []
+            }
+        )
+        
+        compare_channels_func = FunctionDeclaration(
+            name="compare_channels",
+            description="Compare statistics between multiple channels. Use for comparative analysis.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "channels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of channel names to compare"
+                    }
+                },
+                "required": ["channels"]
+            }
+        )
+        
+        # Create Tool object with all functions
+        return Tool(function_declarations=[
+            get_video_stats_func,
+            get_recent_videos_func,
+            search_videos_func,
+            get_channel_stats_func,
+            get_trending_videos_func,
+            compare_channels_func
+        ])
     
     # ========== TOOL IMPLEMENTATIONS ==========
     
     def get_video_stats(self) -> Dict[str, Any]:
-        """
-        Tool: Get total video statistics
-        Returns: Dictionary with total count and channel list
-        """
+        """Tool: Get total video statistics"""
         try:
             total = self.db.videos.count_documents({})
             channels = self.db.videos.distinct("channelTitle")
             
             return {
-                "status": "success",
                 "total_videos": total,
                 "total_channels": len(channels),
-                "channels": channels
+                "channels": channels,
+                "status": "success"
             }
         except Exception as e:
-            return {
-                "status": "error",
-                "message": str(e)
-            }
+            return {"status": "error", "message": str(e)}
     
-    def get_recent_videos(self, limit: int = 5) -> str:
-        """
-        Tool: Get recent videos with formatting
-        Args:
-            limit: Number of videos to retrieve (1-20)
-        Returns: Formatted string with video list
-        """
+    def get_recent_videos(self, limit: int = 5) -> Dict[str, Any]:
+        """Tool: Get recent videos with validation"""
         try:
-            # Input validation
-            limit = min(max(int(limit), 1), 20)
-            
+            limit = min(max(limit, 1), 20)
             videos = list(self.db.videos.find().sort("publishedAt", -1).limit(limit))
             
-            if not videos:
-                return "No videos found in database."
+            results = []
+            for v in videos:
+                results.append({
+                    "title": v.get("title", "N/A"),
+                    "channel": v.get("channelTitle", "N/A"),
+                    "views": v.get("viewCount", 0),
+                    "likes": v.get("likeCount", 0),
+                    "published": str(v.get("publishedAt", "N/A")),
+                    "url": v.get("url", "")
+                })
             
-            result = f"### 🎬 {limit} Most Recent Videos:\n\n"
-            
-            for i, v in enumerate(videos, 1):
-                title = v.get('title', 'N/A')
-                channel = v.get('channelTitle', 'N/A')
-                views = v.get('viewCount', 0)
-                likes = v.get('likeCount', 0)
-                url = v.get('url', '#')
-                
-                result += f"**{i}. {title}**\n"
-                result += f"   - 📺 Channel: {channel}\n"
-                result += f"   - 👁️ Views: {views:,} | 👍 Likes: {likes:,}\n"
-                result += f"   - 🔗 [Watch Video]({url})\n\n"
-            
-            return result
-            
+            return {
+                "status": "success",
+                "count": len(results),
+                "videos": results
+            }
         except Exception as e:
-            return f"Error retrieving recent videos: {str(e)}"
+            return {"status": "error", "message": str(e)}
     
-    def search_videos(self, keyword: str, limit: int = 10) -> str:
-        """
-        Tool: Search videos by keyword
-        Args:
-            keyword: Search term
-            limit: Max results (1-50)
-        Returns: Formatted search results
-        """
+    def search_videos(self, keyword: str, limit: int = 10) -> Dict[str, Any]:
+        """Tool: Search videos by keyword with validation"""
         try:
-            # Input validation
             if not keyword or len(keyword.strip()) < 2:
-                return "❌ Please provide a search keyword (at least 2 characters)"
+                return {
+                    "status": "error",
+                    "message": "Keyword must be at least 2 characters"
+                }
             
-            limit = min(max(int(limit), 1), 50)
-            
-            # Case-insensitive regex search
+            limit = min(max(limit, 1), 50)
             videos = list(self.db.videos.find(
                 {"title": {"$regex": keyword, "$options": "i"}}
             ).limit(limit))
             
-            if not videos:
-                return f"No videos found matching '{keyword}'\n\nTry searching for: news, India, live, reporter"
+            results = []
+            for v in videos:
+                results.append({
+                    "title": v.get("title", "N/A"),
+                    "channel": v.get("channelTitle", "N/A"),
+                    "views": v.get("viewCount", 0),
+                    "url": v.get("url", "")
+                })
             
-            result = f"### 🔍 Found {len(videos)} videos about '{keyword}':\n\n"
-            
-            for i, v in enumerate(videos, 1):
-                title = v.get('title', 'N/A')
-                channel = v.get('channelTitle', 'N/A')
-                views = v.get('viewCount', 0)
-                url = v.get('url', '#')
-                
-                result += f"**{i}. {title}**\n"
-                result += f"   - Channel: {channel}\n"
-                result += f"   - Views: {views:,}\n"
-                result += f"   - [Watch]({url})\n\n"
-            
-            return result
-            
+            return {
+                "status": "success",
+                "keyword": keyword,
+                "count": len(results),
+                "videos": results
+            }
         except Exception as e:
-            return f"Error searching videos: {str(e)}"
+            return {"status": "error", "message": str(e)}
     
-    def get_channel_stats(self, channel_name: str) -> str:
-        """
-        Tool: Get comprehensive channel statistics
-        Args:
-            channel_name: Name of the channel
-        Returns: Formatted channel statistics
-        """
+    def get_channel_stats(self, channel_name: str) -> Dict[str, Any]:
+        """Tool: Get channel statistics with validation"""
         try:
-            if not channel_name or len(channel_name.strip()) < 2:
-                return "❌ Please provide a valid channel name"
+            if not channel_name:
+                return {"status": "error", "message": "Channel name required"}
             
-            # Find all videos from this channel
             videos = list(self.db.videos.find({"channelTitle": channel_name}))
             
             if not videos:
-                # Try to suggest similar channels
                 all_channels = self.db.videos.distinct("channelTitle")
-                suggestions = [c for c in all_channels if channel_name.lower() in c.lower()]
+                matches = [c for c in all_channels if channel_name.lower() in c.lower()]
                 
-                if suggestions:
-                    return f"Channel '{channel_name}' not found.\n\n**Did you mean:** {', '.join(suggestions)}"
-                else:
-                    return f"Channel '{channel_name}' not found.\n\n**Available channels:** {', '.join(all_channels)}"
+                return {
+                    "status": "not_found",
+                    "message": f"Channel '{channel_name}' not found",
+                    "suggestions": matches
+                }
             
-            # Calculate statistics
             total_views = sum(v.get("viewCount", 0) for v in videos)
             total_likes = sum(v.get("likeCount", 0) for v in videos)
-            total_comments = sum(v.get("commentCount", 0) for v in videos)
             
-            avg_views = total_views // len(videos) if videos else 0
-            avg_likes = total_likes // len(videos) if videos else 0
-            
-            # Get most viewed video
-            most_viewed = max(videos, key=lambda x: x.get('viewCount', 0))
-            
-            result = f"### 📺 {channel_name} Channel Statistics:\n\n"
-            result += f"**Overview:**\n"
-            result += f"- Total Videos: **{len(videos)}**\n"
-            result += f"- Total Views: **{total_views:,}**\n"
-            result += f"- Total Likes: **{total_likes:,}**\n"
-            result += f"- Total Comments: **{total_comments:,}**\n\n"
-            
-            result += f"**Averages:**\n"
-            result += f"- Avg Views per Video: **{avg_views:,}**\n"
-            result += f"- Avg Likes per Video: **{avg_likes:,}**\n\n"
-            
-            result += f"**Most Popular Video:**\n"
-            result += f"- Title: {most_viewed.get('title', 'N/A')}\n"
-            result += f"- Views: {most_viewed.get('viewCount', 0):,}\n"
-            
-            return result
-            
+            return {
+                "status": "success",
+                "channel": channel_name,
+                "total_videos": len(videos),
+                "total_views": total_views,
+                "total_likes": total_likes,
+                "avg_views": total_views // len(videos) if videos else 0,
+                "avg_likes": total_likes // len(videos) if videos else 0
+            }
         except Exception as e:
-            return f"Error getting channel stats: {str(e)}"
+            return {"status": "error", "message": str(e)}
     
-    def get_trending_videos(self, limit: int = 5) -> str:
-        """
-        Tool: Get trending videos (sorted by views)
-        Args:
-            limit: Number of videos (1-20)
-        Returns: Formatted trending videos list
-        """
+    def get_trending_videos(self, limit: int = 5) -> Dict[str, Any]:
+        """Tool: Get trending videos sorted by views"""
         try:
-            limit = min(max(int(limit), 1), 20)
-            
+            limit = min(max(limit, 1), 20)
             videos = list(self.db.videos.find().sort("viewCount", -1).limit(limit))
             
-            if not videos:
-                return "No videos found in database."
+            results = []
+            for v in videos:
+                results.append({
+                    "title": v.get("title", "N/A"),
+                    "channel": v.get("channelTitle", "N/A"),
+                    "views": v.get("viewCount", 0),
+                    "likes": v.get("likeCount", 0),
+                    "url": v.get("url", "")
+                })
             
-            result = f"### 🔥 Top {limit} Trending Videos (Most Views):\n\n"
-            
-            for i, v in enumerate(videos, 1):
-                title = v.get('title', 'N/A')
-                channel = v.get('channelTitle', 'N/A')
-                views = v.get('viewCount', 0)
-                likes = v.get('likeCount', 0)
-                url = v.get('url', '#')
-                
-                result += f"**{i}. {title}**\n"
-                result += f"   - Channel: {channel}\n"
-                result += f"   - 👁️ **{views:,}** views | 👍 {likes:,} likes\n"
-                result += f"   - [Watch]({url})\n\n"
-            
-            return result
-            
+            return {
+                "status": "success",
+                "count": len(results),
+                "videos": results
+            }
         except Exception as e:
-            return f"Error getting trending videos: {str(e)}"
+            return {"status": "error", "message": str(e)}
     
-    def compare_channels(self, channels: List[str]) -> str:
-        """
-        Tool: Compare statistics between multiple channels
-        Args:
-            channels: List of channel names to compare
-        Returns: Comparative analysis
-        """
+    def compare_channels(self, channels: List[str]) -> Dict[str, Any]:
+        """Tool: Compare multiple channels"""
         try:
             if not channels or len(channels) < 2:
-                return "❌ Please provide at least 2 channels to compare"
+                return {
+                    "status": "error",
+                    "message": "Need at least 2 channels to compare"
+                }
             
-            result = "### 🔍 Channel Comparison:\n\n"
-            
+            comparison = {}
             for channel in channels:
                 stats = self.get_channel_stats(channel)
-                result += f"{stats}\n\n---\n\n"
+                if stats.get("status") == "success":
+                    comparison[channel] = stats
             
-            return result
-            
+            return {
+                "status": "success",
+                "comparison": comparison,
+                "channels_compared": len(comparison)
+            }
         except Exception as e:
-            return f"Error comparing channels: {str(e)}"
+            return {"status": "error", "message": str(e)}
+    
+    # ========== FORMATTING ==========
+    
+    def _format_response(self, data: Dict, query_type: str) -> str:
+        """Format tool responses for display"""
+        if query_type == "stats":
+            if data.get("status") == "success":
+                channels_str = ", ".join(data["channels"])
+                return f"📊 **Database Stats:**\n\nTotal Videos: **{data['total_videos']}**\nChannels: {channels_str}"
+            return f"Error: {data.get('message')}"
+        
+        elif query_type == "recent":
+            if data.get("status") == "success":
+                result = f"### 🎬 Recent Videos:\n\n"
+                for i, v in enumerate(data["videos"], 1):
+                    result += f"**{i}. {v['title']}**\n   - {v['channel']} | {v['views']:,} views\n\n"
+                return result
+            return f"Error: {data.get('message')}"
+        
+        elif query_type == "search":
+            if data.get("status") == "success":
+                if data["count"] == 0:
+                    return f"No videos found for '{data['keyword']}'"
+                result = f"### 🔍 Found {data['count']} videos:\n\n"
+                for i, v in enumerate(data["videos"], 1):
+                    result += f"**{i}. {v['title']}**\n   - {v['views']:,} views\n\n"
+                return result
+            return f"Error: {data.get('message')}"
+        
+        elif query_type == "channel":
+            if data.get("status") == "success":
+                return f"### 📺 {data['channel']}:\n\nVideos: **{data['total_videos']}**\nTotal Views: **{data['total_views']:,}**\nAvg Views: **{data['avg_views']:,}**"
+            return f"Error: {data.get('message')}"
+        
+        elif query_type == "trending":
+            if data.get("status") == "success":
+                result = f"### 🔥 Trending Videos:\n\n"
+                for i, v in enumerate(data["videos"], 1):
+                    result += f"**{i}. {v['title']}**\n   - {v['views']:,} views\n\n"
+                return result
+            return f"Error: {data.get('message')}"
+        
+        return str(data)
+    
+    # ========== TOOL ORCHESTRATION ==========
+    
+    def _execute_function(self, function_call) -> Any:
+        """Execute function calls from the model"""
+        function_name = function_call.name
+        function_args = {}
+        
+        if function_call.args:
+            function_args = dict(function_call.args)
+        
+        try:
+            if function_name == "get_video_stats":
+                return self.get_video_stats()
+            elif function_name == "get_recent_videos":
+                limit = function_args.get("limit", 5)
+                return self.get_recent_videos(limit)
+            elif function_name == "search_videos":
+                keyword = function_args.get("keyword", "")
+                limit = function_args.get("limit", 10)
+                return self.search_videos(keyword, limit)
+            elif function_name == "get_channel_stats":
+                channel = function_args.get("channel_name", "")
+                return self.get_channel_stats(channel)
+            elif function_name == "get_trending_videos":
+                limit = function_args.get("limit", 5)
+                return self.get_trending_videos(limit)
+            elif function_name == "compare_channels":
+                channels = function_args.get("channels", [])
+                return self.compare_channels(channels)
+            else:
+                return {"status": "error", "message": f"Unknown function: {function_name}"}
+        except Exception as e:
+            return {"status": "error", "function": function_name, "message": str(e)}
+    
+    # ========== FALLBACK ROUTING ==========
+    
+    def _fallback_query(self, user_input: str) -> str:
+        """Fallback query handling without function calling"""
+        user_lower = user_input.lower()
+        
+        if any(word in user_lower for word in ["how many", "total", "count"]):
+            data = self.get_video_stats()
+            return self._format_response(data, "stats")
+        
+        elif any(word in user_lower for word in ["recent", "latest"]):
+            data = self.get_recent_videos(5)
+            return self._format_response(data, "recent")
+        
+        elif any(word in user_lower for word in ["trending", "popular"]):
+            data = self.get_trending_videos(5)
+            return self._format_response(data, "trending")
+        
+        elif any(word in user_lower for word in ["search", "find", "about"]):
+            words = user_input.split()
+            keyword = words[-1] if words else "news"
+            data = self.search_videos(keyword, 10)
+            return self._format_response(data, "search")
+        
+        elif any(word in user_lower for word in ["channel", "reporter", "ani"]):
+            channel = "REPORTER" if "reporter" in user_lower else "ANI News"
+            data = self.get_channel_stats(channel)
+            return self._format_response(data, "channel")
+        
+        elif "compare" in user_lower:
+            data = self.compare_channels(["REPORTER", "ANI News"])
+            return str(data)
+        
+        else:
+            prompt = f"User asked: {user_input}\n\nSuggest what they can ask about a YouTube video database."
+            response = self.model.generate_content(prompt)
+            return response.text
     
     # ========== MAIN QUERY METHOD ==========
     
-    def query(self, user_input: str) -> str:
-        """
-        Main query handler with intelligent routing
-        
-        Features:
-        - Automatic tool selection based on query analysis
-        - Multi-tool orchestration for complex queries
-        - Error handling and fallback responses
-        - AI-powered responses for ambiguous queries
-        
-        Args:
-            user_input: Natural language query from user
-            
-        Returns:
-            Formatted response string
-        """
-        
-        if not self.initialized:
-            return "⚠️ Agent not initialized properly. Please check database connection."
-        
+    def query(self, user_input: str, max_iterations: int = 5) -> str:
+        """Main query with automatic fallback"""
         try:
-            user_lower = user_input.lower()
-            
-            # ===== TOOL ROUTING LOGIC =====
-            
-            # Video Count Query
-            if any(word in user_lower for word in ["how many", "total", "count", "number of"]):
-                stats = self.get_video_stats()
-                if stats["status"] == "success":
-                    channels_str = ", ".join(stats["channels"])
-                    return f"📊 **Database Statistics:**\n\nWe have **{stats['total_videos']} videos** from **{stats['total_channels']} channels**:\n\n{channels_str}"
-                else:
-                    return f"Error: {stats['message']}"
-            
-            # Recent Videos Query
-            elif any(word in user_lower for word in ["recent", "latest", "new"]):
-                return self.get_recent_videos(5)
-            
-            # Trending Videos Query
-            elif any(word in user_lower for word in ["trending", "popular", "most viewed", "top"]):
-                return self.get_trending_videos(5)
-            
-            # Search Query
-            elif any(word in user_lower for word in ["search", "find", "about", "videos on"]):
-                # Extract keyword
-                stop_words = ["search", "find", "videos", "about", "for", "me", "on", "the", "show"]
-                words = user_input.lower().split()
-                keyword = None
-                
-                for word in words:
-                    if word not in stop_words and len(word) > 2:
-                        keyword = word
-                        break
-                
-                if keyword:
-                    return self.search_videos(keyword, 10)
-                else:
-                    return "Please specify what to search for.\n\nExample: 'Find videos about news' or 'Search for India'"
-            
-            # Channel Statistics Query
-            elif any(word in user_lower for word in ["channel", "reporter", "ani"]):
-                if "reporter" in user_lower:
-                    return self.get_channel_stats("REPORTER")
-                elif "ani" in user_lower:
-                    return self.get_channel_stats("ANI News")
-                else:
-                    return "Which channel would you like stats for?\n\nAvailable: REPORTER, ANI News"
-            
-            # Comparison Query
-            elif "compare" in user_lower:
-                channels = ["REPORTER", "ANI News"]
-                return self.compare_channels(channels)
-            
-            # Help Query
-            elif "help" in user_lower:
-                return """### 💡 What I Can Help You With:
-                
-**📊 Statistics:**
-- "How many videos do we have?"
-- "Total videos in database"
-
-**🎬 Video Lists:**
-- "Show me recent videos"
-- "Latest uploads"
-
-**🔥 Trending:**
-- "What are the trending videos?"
-- "Most popular videos"
-
-**🔍 Search:**
-- "Find videos about [keyword]"
-- "Search for [topic]"
-
-**📺 Channel Info:**
-- "Tell me about REPORTER channel"
-- "ANI channel statistics"
-
-**🔄 Comparison:**
-- "Compare REPORTER and ANI channels"
-
-Try any of these questions!"""
-            
-            # AI-Powered Response for Complex/Ambiguous Queries
+            # If function calling is available, use it
+            if self.use_function_calling:
+                try:
+                    response = self.chat.send_message(user_input)
+                    iteration = 0
+                    
+                    while iteration < max_iterations:
+                        if hasattr(response.candidates[0].content.parts[0], 'function_call') and response.candidates[0].content.parts[0].function_call:
+                            function_call = response.candidates[0].content.parts[0].function_call
+                            function_result = self._execute_function(function_call)
+                            
+                            response = self.chat.send_message(
+                                genai.protos.Content(
+                                    parts=[genai.protos.Part(
+                                        function_response=genai.protos.FunctionResponse(
+                                            name=function_call.name,
+                                            response={'result': function_result}
+                                        )
+                                    )]
+                                )
+                            )
+                            iteration += 1
+                        else:
+                            break
+                    
+                    return response.text
+                except Exception as e:
+                    # Fall back to simple routing
+                    print(f"Function calling failed, using fallback: {e}")
+                    return self._fallback_query(user_input)
             else:
-                context = f"""You are a YouTube analytics assistant.
-
-Database Info:
-- We have 133+ videos from news channels like REPORTER and ANI News
-- Videos cover news, current affairs, and breaking news
-
-User Query: {user_input}
-
-Provide a helpful 2-3 sentence response. If the query is unclear, suggest what they can ask about from the available tools:
-- Video counts
-- Recent videos
-- Trending videos
-- Search by keyword
-- Channel statistics
-"""
-                
-                response = self.model.generate_content(context)
-                return response.text
+                # Use fallback routing
+                return self._fallback_query(user_input)
         
         except Exception as e:
-            # Production-grade error handling
-            error_msg = f"⚠️ An error occurred: {str(e)}\n\n"
-            error_msg += "**Try these queries:**\n"
-            error_msg += "- How many videos do we have?\n"
-            error_msg += "- Show me recent videos\n"
-            error_msg += "- Tell me about REPORTER channel\n"
-            error_msg += "- Find videos about news\n"
-            
-            return error_msg
+            error_message = f"⚠️ Error: {str(e)}\n\nTry: 'How many videos?', 'Show recent videos', 'REPORTER channel stats'"
+            return error_message
 
-# Create global agent instance
+# Create agent instance
 agent = YouTubeADKAgent()
